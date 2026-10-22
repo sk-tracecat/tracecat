@@ -1,6 +1,6 @@
 ---
 name: sublime-phishing-case-lifecycle
-description: "Load when the prompt's first line is `Phishing message <canonical_id>`, followed by one Sublime message group as JSON. Takes one flagged or user-reported email from Sublime to a triaged case and a published Slack card. You read the group, pull its indicators with MQL, deduplicate it against existing cases, scope the campaign across the tenant, place each recipient in Google Workspace, look for interaction and account abuse in the audit log, score it, write the case and post the card. Also load when the first line is `Phishing resolution <canonical_id>`, which carries an analyst's resolved verdict that the workflow has already pushed to Sublime; on that path you record the outcome and, when containment is still outstanding, write the manual quarantine handoff. Load with email-evidence-core, business-context, hypothesis-driven-triage, case-output, case-writing-style, slack-case-threads and org-chart."
+description: "Load when the prompt's first line is `Phishing message <canonical_id>`, followed by one Sublime message group as JSON. Takes one flagged or user-reported email from Sublime to a triaged Tracecat case and a published Slack card. You read the group, pull its indicators with MQL, deduplicate it against existing cases, scope the campaign across the tenant, place each recipient in Google Workspace, look for interaction and account abuse in the audit log, score it, write the case and post the card. Also load when the first line is `Phishing resolution <canonical_id>`, which carries an analyst's resolved verdict that the workflow has already pushed to Sublime; on that path you record the outcome and, when containment is still outstanding, write the manual quarantine handoff. Load with email-evidence-core, business-context, hypothesis-driven-triage, case-output, case-writing-style, slack-case-threads and org-chart."
 ---
 
 # Sublime phishing case lifecycle
@@ -16,6 +16,7 @@ A message group is the unit of work, not a message. Sublime groups the messages 
 | `Phishing message <canonical_id>` | Triage. Section 2. |
 | `Phishing group to investigate` | Triage. Section 2. The workflow uses this first line for the same path. |
 | `Phishing resolution <canonical_id>` | Record an analyst's resolution. Section 5. |
+| `Phishing scan links <canonical_id>` | Scan the group's links. Section 10. |
 
 The prompt also carries, as JSON, the values the workflow derived. Use them exactly as given and never recompute them:
 
@@ -242,7 +243,7 @@ Do this:
 1. Read the Sublime readback in the prompt. The push succeeded when `review_status` is no longer `unreviewed`. Say which it is.
 2. Add one comment to the case: the verdict the analyst set, the classification pushed to Sublime, the outcome of the push, and the time. If the push failed, give the error plainly and say the verdict is recorded on the case but not in Sublime.
 3. Reply once in the card's thread with the same outcome in one or two sentences.
-4. Rewrite the card message so it shows the current state: the verdict, who resolved it, and whether Sublime accepted it.
+4. Rewrite the card so it shows the current state: the verdict, who resolved it, and whether Sublime accepted it. Use `chat_update` with the card's `ts` and the entity object from the `slack_work_objects` row, with the resolved values written into `custom_fields`, `actions` removed and `metadata_last_modified` refreshed. Update the row's `entity` column to match. A card still offering a verdict after one was recorded invites a second press.
 5. **If the prompt says containment was not performed, consult section 7's table and create the tasks when it calls for them**, and say in the thread reply that they are on the case. A verdict of malicious with the mail still sitting in an inbox is not a closed loop, and the person reading the thread is the one who can close it.
 
 Do not re-investigate. Do not re-score. Do not create a second case. Do not call Sublime again beyond reading the group if the readback in the prompt is missing.
@@ -300,94 +301,167 @@ This task is the hunt's payoff. Without it the most valuable thing the hunt foun
 
 Three messages: the card, then the brief as its first thread reply, then the evidence table as the second. Post all three to `slack_channel`.
 
-**The card is an ordinary Block Kit message, not a Slack Work Object.** Build it from blocks yourself. A Work Object caps at two primary actions and this card carries three, and the layout below is the one readers use.
+**The card is a Slack Work Object, not a Block Kit message.** Post it with `tools.slack_sdk.call_method`, `sdk_method` `chat_postMessage`. The whole card lives in `metadata.entities[0]`, and Slack renders the layout, the fields and the buttons from that one object. You build no blocks. The brief and the evidence table stay ordinary Slack messages in the thread and keep the shape 8.5 and 8.6 describe.
 
-Still write the `slack_work_objects` row after posting the card. That row is how `slack-case-threads` finds the case when somebody replies in the thread later. It is a mapping row; it does not make the message a Work Object.
+The envelope:
 
-Pass `core.table.insert_row` with `table: slack_work_objects`, `upsert: true`, and `row_data` holding **exactly these four columns**:
+```json
+{
+  "channel": "<slack_channel>",
+  "unfurl_links": false,
+  "unfurl_media": false,
+  "metadata": {"entities": [ <the entity object> ]}
+}
+```
+
+**On `chat_postMessage`, never send a `text` field.** A Work Object does not need one, and leaving it out is a safety net rather than a saving. When the metadata is malformed Slack has nothing else to post, so the call fails loudly with `ok: false` and `error: no_text`. Add a `text` and that same broken metadata is dropped with only a warning: the call returns `ok: true`, and you have published an empty message that reads as a success in the run record.
+
+**On `chat_update`, the opposite is true: `text` is required.** `chat.update` rejects a metadata-only call with `ok: false` and `error: no_text`, every time, even when the metadata is perfectly valid. Send `"text": " "`, a single space, alongside the metadata. The space does not appear on the card, which re-renders from the metadata exactly as it did when posted. This is tested, not assumed. Do not carry the no-`text` rule across from `chat_postMessage`: these are two different API methods with opposite requirements, and treating them the same silently breaks every card rewrite.
+
+The entity object:
+
+| Key | Value |
+| --- | --- |
+| `entity_type` | `slack#/entities/incident` |
+| `url` | `<case_url_base><case id>`. Slack builds an **Open in Tracecat** item from this by itself. Never spend an action on it. |
+| `external_ref` | `{"id": "phish:<canonical_id>", "type": "tracecat_case"}` |
+| `app_unfurl_url` | the same value as `url` |
+| `entity_payload` | `attributes`, `custom_fields`, `display_order`, `fields: {}` and `actions`. See 8.2 and 8.3. |
+
+`attributes` holds `title.text` (the headline from 8.2), `display_id` (the case short ID), `display_type` `Phishing`, `product_name` `Tracecat`, and `metadata_last_modified` as the current Unix time in seconds.
+
+**The key is `phish:<canonical_id>`, and it is not optional.** Slack returns it as `container.external_ref.id` on every button press and on every details request, so it is the one identifier that reaches you without being parsed out of anything. Build it at the start and use the same string in the entity and in the table row.
+
+### 8.1 The slack_work_objects row
+
+Write this row immediately after the card and before the brief, so a short run never leaves a card that threads cannot resolve. It is how the thread, the hunt and the details panel all find their way back to the case.
+
+Call `core.table.insert_row`. **`row_data` is an object. Never serialise it to a string.**
+
+This is the exact shape. Copy it:
+
+```json
+{
+  "table": "slack_work_objects",
+  "upsert": true,
+  "row_data": {
+    "external_ref_id": "phish:<canonical_id>",
+    "case_id": "<case UUID>",
+    "channel": "<channel id>",
+    "message_ts": "<the card's ts>",
+    "entity": { "entity_type": "slack#/entities/incident", "url": "...", "external_ref": {...}, "entity_payload": {...} }
+  }
+}
+```
+
+**The single most common failure here is passing `row_data` as a JSON string**, like `"row_data": "{\"external_ref_id\": ...}"`. The schema requires an object, so a string is rejected with a **422** before it reaches the table. The `entity` value is large and deeply nested, which is what tempts the mistake: serialise `entity` and you will usually serialise the whole of `row_data` with it. Both stay objects. Nested objects are accepted and stored correctly; this is tested.
+
+The five columns:
 
 | Column | Value |
 | --- | --- |
-| `external_ref_id` | the case ID. **Required.** Omitting it fails the call with `missing_required_column`. |
-| `case_id` | the case ID, again |
+| `external_ref_id` | `phish:<canonical_id>`, the same string as the entity's `external_ref.id`. **Required.** Omitting it fails the call with `missing_required_column`. |
+| `case_id` | the case **UUID**. Always the UUID, never the short ID. |
 | `channel` | the channel the card went to |
 | `message_ts` | the card's `ts`, not the brief's |
+| `entity` | the entity object exactly as you posted it, **unwrapped**: the object itself, not the `{"entities": [...]}` envelope around it |
 
-Never send `updated_at`; the column does not exist and the call fails. Write this row immediately after the card and before the brief, so a short run never leaves a card that threads cannot resolve.
+Two of those are easy to get wrong and both fail quietly.
 
-### 8.1 Backticks
+`case_id` must be the UUID because the mailbox hunt looks the thread up by it. Store the UUID only. A short id in this column will not match a lookup by UUID.
 
-**Wrap every machine value in backticks, everywhere in Slack.** This is a safety rule before it is a formatting one. Slack turns a bare email address or domain into a clickable link, so an attacker's address becomes a one-tap mailto and an attacker's domain becomes a live link on the very card warning people about it. Backticks also make a long identifier readable at a glance.
+`entity` must be unwrapped because the details panel passes this column straight to `entity.presentDetails` as its `metadata`. Store the envelope and the panel receives an object it cannot read, so it spins and then times out with no error anywhere.
+
+Never send `updated_at`; the column does not exist and the call fails.
+
+**A row that already exists for your key is stale, not a rival.** The key is `phish:<canonical_id>`, so it deliberately outlives any one case: delete a case and its row stays behind, pointing at a case that now returns 404. When you find a row for your key, overwrite it with `upsert: true` and move on. Do not read the old `case_id`, discover it 404s, and conclude that the case you just created is a duplicate. It is not. **Deduplication is decided by the `phish-<canonical id>` case tag search in section 2 and by nothing else.** A table row is a pointer to a Slack card; it is never evidence about which case is real.
+
+**If the row write fails, say so and keep going.** Report the exact error text in your closing line, retry once with only the five columns above and nothing else, and carry on to post the brief and the evidence table. A failed pointer write costs the thread its lookup. Abandoning the run after it costs the reader the entire investigation, and it is the worse outcome by far. Never delete, close or walk back a case you correctly created because a table write failed.
+
+### 8.2 Backticks, and where they still apply
+
+**Wrap every machine value in backticks in the brief and the evidence table.** This is a safety rule before it is a formatting one. Slack turns a bare email address or domain into a clickable link, so an attacker's address becomes a one-tap mailto and an attacker's domain becomes a live link in the very thread warning people about it.
 
 Backtick: every email address, every domain, the canonical ID, the Message-ID, every hash, every IP.
 
 Do not backtick: the verdict, the severity, the rule description, the deviation sentence, a person's name, a date.
 
-The only clickable value anywhere is the Case link.
+**The card is the exception, and it needs no backticks at all.** A Work Object custom field is plain text, not mrkdwn. Slack does not linkify anything in it, so an attacker's address on the card is already inert. Backticks there buy no safety and are not interpreted. The one clickable value on the whole card is the Case field, and it is clickable because it carries a `link`, not because of anything in its text.
 
-### 8.2 The card
+### 8.3 The card
 
-Four blocks, in this order.
+The headline is `attributes.title.text`: `Phishing: <attack in plain words>`. Example: `Phishing: BEC impersonation of Jane Doe`.
 
-1. `header`, `plain_text`: `Phishing: <attack in plain words>`. Example: `Phishing: BEC impersonation of Jane Doe`
-2. `section` with a `fields` array, nine `mrkdwn` entries, each `*Label*\n<value>`, in this order:
+Everything else is `custom_fields`, each entry shaped `{"key", "label", "type": "string", "long", "value"}`, with `display_order` listing every key in the order below.
 
-| Field | Value |
-| --- | --- |
-| Verdict | `<verdict> · <severity> severity`, plain |
-| Rule | Sublime's highest-severity flagged rule in plain words, 8 words or fewer, shaped `<attack type>: <what was detected>` |
-| Deviation | the one fact that makes this not ordinary mail, 10 words or fewer |
-| Who | sender display name plain, then the address in backticks |
-| Recipients | the count plain, then each address in backticks |
-| Hunt | the hunt result in 6 words or fewer, shaped `<n> groups matched, <m> unflagged`. Write `none found` when the hunt matched nothing, and `not run` when the verdict is not malicious. Never leave this field out. |
-| Seen | the delivery time plain, then `still in the mailbox` unless the record says otherwise |
-| Message group | the canonical ID in backticks |
-| Case | a markdown link built as `<case_url_base><case id>|<short id>>`. The one clickable value among the fields. Never write the short ID as plain text when `case_url_base` is in the prompt. |
+| # | `key` | Label | `long` | Value |
+| --- | --- | --- | --- | --- |
+| 1 | `verdict` | Verdict | `false` | `<verdict> - <severity> severity` |
+| 2 | `hunt` | Hunt | `false` | the hunt result in 4 words or fewer, shaped `<n> matched, <m> unflagged`. Write `none found` when the hunt matched nothing, and `not run` when the verdict is not malicious. Never leave this field out. |
+| 3 | `rule` | Rule | `true` | Sublime's highest-severity flagged rule in plain words, 8 words or fewer, shaped `<attack type>: <what was detected>` |
+| 4 | `deviation` | Deviation | `true` | the one fact that makes this not ordinary mail, 10 words or fewer |
+| 5 | `who` | Who | `true` | sender display name, then the address |
+| 6 | `recipients` | Recipients | `true` | the count, then each address |
+| 7 | `seen` | Seen | `false` | the delivery time, and `still in the mailbox` unless the record says otherwise |
+| 8 | `case` | Case | `false` | `value` is the short ID; `link` is `<case_url_base><case id>` |
+| 9 | `group` | Message group | `true` | the canonical ID |
 
-3. `context`, one `mrkdwn` line: what is unresolved and what a person must decide. Say plainly when the message is still in the mailbox and that Sublime cannot remove it on this tier.
-4. `actions`, the three verdict buttons from 8.3.
+A fact sheet, not prose. One short value per field, no sentences.
 
-A fact sheet, not prose. One short value per field, no sentences in the fields.
+Three layout rules decide what a reader actually sees.
 
-### 8.3 The buttons: two rows, two meanings
+**`long` controls the column.** `long: true` gives the field a full-width row of its own. `long: false` pairs it with the next `long: false` field in a two-column row. That is why the order above pairs Verdict with Hunt, and Seen with Case.
 
-The card carries **two separate `actions` blocks**, and the split is the point. Slack offers only three button styles, so grouping and labelling carry the meaning, not colour alone.
+**A short-column value truncates.** A `long: false` value longer than roughly 30 characters is cut with an ellipsis, and the reader cannot expand it on the card. Keep all four paired values short. This is why Hunt is capped at four words.
 
-**Row one decides.** Three buttons, no emoji. Pressing one records a verdict and resolves the case.
+**The card face clips after about six rows.** The nine fields above make seven rows, and the last one is cut off. That is by design, not a bug to work around: every field is still in the details panel, so order by what a reader needs at a glance and let the tail fall through. Message group is last because a canonical ID is a machine value nobody reads off a card.
 
-| Button | `action_id` | Style |
+A Work Object has no `context` block, so the two lines the old card carried there now live elsewhere. `still in the mailbox` is part of the Seen field. The decision itself is the buttons. Anything a person must weigh before pressing goes in the brief.
+
+### 8.4 The buttons
+
+**Two primary actions, and Slack allows no more.**
+
+| Button | `action_id` | `style` |
 | --- | --- | --- |
 | Malicious | `phish_verdict_malicious` | `danger` |
-| Spam | `phish_verdict_spam` | default |
 | Benign | `phish_verdict_benign` | `primary` |
 
-Red and green are the two ends of the decision.
+These are the two ends of the decision, red and green, and they are the only thing a reader sees without hovering. Omit both when the verdict you wrote is `benign` or `simulation`: there is nothing left to decide.
 
-**Every button's `value` is `<case id>|<canonical id>`, joined with one pipe and nothing else.** Both halves, every time, on the verdict buttons, on `Generate detection` and on `Scan links`. The workflow reads the case from the first half and the Sublime message group from the second, so a button carrying only the case ID cannot push a verdict back to Sublime and the classification is silently skipped. Also set `block_id` = `phish_verdict:<short id>:<canonical_id>`.
+**Five overflow actions, and five is a hard cap.**
 
-Omit row one entirely when the verdict you wrote is `benign` or `simulation`. There is nothing left to decide.
-
-**Row two investigates, generates and navigates.** Every button here is prefixed with an emoji so it cannot be mistaken for a verdict.
-
-| Button | `action_id` | Emoji | What it does |
+| Button text | `action_id` | Carries | What it does |
 | --- | --- | --- | --- |
-| Generate detection | `phish_gen_detection` | `:gear:` | Asks the detection engineer to author and backtest a Sublime rule from this message. **This one acts**, and it is the only way the detection path starts. Include it on every card whose verdict is `malicious` or `spam`. It carries `value` = `<case id>|<canonical id>`. Pressing it does not change the case verdict and does not resolve the case. |
-| Scan links | `phish_scan_links` | `:mag:` | Submits the links to urlscan. **This one acts.** Include it whenever the message has at least one link, without exception. `email-evidence-core` forbids **you** from submitting a URL to urlscan, because an agent disclosing an attacker's link on its own initiative is not a decision you get to make. That rule does not apply to this button: here a named person reads the warning and authorises the disclosure themselves. Offering the choice is not the same as making it, so never leave the button off on the grounds that scanning is forbidden. |
-| Open case | `phish_link_case` | `:link:` | Opens the case. `url` = `case_url_base` + the case ID |
-| Sublime message | `phish_link_sublime` | `:link:` | `url` = `sublime_base_url` + `/messages/` + the canonical ID. This lands on the message this card is about, not on a list the reader then has to search. |
-| Google Admin | `phish_link_gadmin` | `:link:` | `url` = `google_admin_url` from the prompt |
+| Mark as spam | `phish_verdict_spam` | `value` | the third verdict, one press away rather than on the face |
+| Generate detection rule | `phish_gen_detection` | `value` | Asks the detection engineer to author and backtest a Sublime rule from this message. **This one acts**, and it is the only way the detection path starts. Include it on every card whose verdict is `malicious` or `spam`. Pressing it does not change the verdict and does not resolve the case. |
+| Scan links with urlscan | `phish_scan_links` | `value` | Submits the links to urlscan. **This one acts.** Include it whenever the message has at least one link, without exception. `email-evidence-core` forbids **you** from submitting a URL to urlscan, because an agent disclosing an attacker's link on its own initiative is not a decision you get to make. That rule does not apply to this button: a named person reads the warning and authorises the disclosure themselves. Offering the choice is not the same as making it, so never leave the button off on the grounds that scanning is forbidden. |
+| Open in Sublime | `phish_link_sublime` | `url` | `sublime_base_url` + `/messages/` + the canonical ID. This lands on the message this card is about, not a list the reader then has to search. |
+| Open Google Admin console | `phish_link_gadmin` | `url` | `google_admin_url` from the prompt |
 
-The three `:link:` buttons carry a `url` and change nothing. `Scan links` carries no `url`, carries `value` = `<case id>|<canonical id>` and `block_id` = `phish_scan:<short id>:<canonical_id>`, and needs an approver.
+**A sixth item costs you the whole card.** Slack rejects the call with `ok: false`, `error: no_text`, and a warning naming `no more than 5 items allowed`. It does not drop the extra item and keep the rest; it discards the entire metadata object. Count before you post.
 
-Put a `context` line between the two rows: `Decide above. Generate detection writes a rule proposal for review. Scanning submits the link publicly and the sender can see it.`
+**There is no `Open case` action, and there must not be one.** Slack already builds an **Open in Tracecat** item from the entity's `url`, free and automatic, and the Case field carries the same link. Adding it would spend the fifth slot and push a real action off the card.
 
-**The two rows do different things to the card.** A press in row one records the verdict, resolves the case and rewrites the card without its buttons, because the decision is made and the buttons have served their purpose. `Generate detection` deliberately leaves the card untouched, so the verdict buttons survive and a person can ask for a rule first and decide the verdict afterwards. Its acknowledgement goes to the thread instead.
+**Every overflow label names its own verb, because the overflow has no context.** The two primary buttons sit together under the card, so `Malicious` and `Benign` read as a verdict pair without help. An overflow item does not: Slack lists it in its own hover menu beside *Share* and *Copy link*, where a bare `Spam` or `Google Admin` tells a reader nothing about what pressing it will do. So each one opens with a verb, as the table above spells out: **Mark as spam**, **Generate detection rule**, **Scan links with urlscan**, **Open in Sublime**, **Open Google Admin console**. A reader should be able to tell an action that changes something from one that merely navigates, by reading the label alone.
+
+**Changing a label never changes an `action_id`.** The router matches on `action_id` and nothing else, so the text is free to improve and the identifier is frozen. Rewording `Spam` to `Mark as spam` is a display change; renaming `phish_verdict_spam` would send the press to the catch-all and into the wrong workflow.
+
+**Write action text as plain words. Emoji shortcodes do not render.** `:link: Sublime message` appears on the menu as that literal string, colons and all. The old card used an emoji to separate the acting buttons from the navigating ones. The overflow does that work by itself: Slack groups every one of these under a `Tracecat` heading, apart from its own menu items.
+
+**The overflow is not on the card face.** Slack folds it into the message's hover ellipsis. At rest a reader sees the two primary buttons and nothing more. Never put something on the overflow and describe it anywhere as though it were visible.
+
+**Every acting button's `value` is `<case id>|<canonical id>`, joined with one pipe and nothing else.** Both halves, every time, on all three verdicts, on `Generate detection rule` and on `Scan links with urlscan`. The workflow reads the case from the first half and the Sublime message group from the second, so a button carrying only the case ID cannot push a verdict back to Sublime and the classification is silently skipped.
+
+**You cannot set `block_id`.** A Work Object action has no such field and Slack assigns its own. What the old card encoded there now travels two better ways: `value` carries the pair above, and Slack puts the card's own key in `container.external_ref.id` on every press. Read the key from `container.external_ref.id` and treat `value` as the detail.
 
 All of them take the `phish_` prefix. Never use another prefix: the router's last route is a catch-all, so an unrecognised button is dispatched to the alert triage workflow instead of here.
 
+**The buttons do different things to the card.** A verdict press records the verdict, resolves the case and rewrites the card without its `actions`, because the decision is made and the buttons have served their purpose. Rewrite it with `chat_update`, the same `ts`, and the same entity object with `actions` removed and `metadata_last_modified` refreshed. `Generate detection` deliberately leaves the card untouched, so the verdict buttons survive and a person can ask for a rule first and decide afterwards; its acknowledgement goes to the thread instead.
+
 **Why `Scan links` sits on the card and not the evidence table.** It was on the table, and the table is the first thing dropped when the run is short of budget, so the button vanished with it. An action a person needs belongs on the message they are looking at.
 
-### 8.4 The brief
+### 8.5 The brief
 
 The first reply in the card's thread, edited in place on a later re-triage rather than reposted. Read on a phone in ten seconds. 450 characters or fewer including the verdict line.
 
@@ -410,7 +484,15 @@ Then exactly these four labels, one line each:
 
 When containment is outstanding, next step 1 is the removal and a person owns it: `1. Security: remove from <n> mailbox(es)`. Never write it as done.
 
-### 8.5 The evidence table and the scan button
+**The card has no context line, so two things the old card said there belong here.** State in step 1 that the removal is manual, because Sublime cannot remove the message on this tier and a person has to do it. And when the card offers `Scan links`, close the brief with this line, which sits outside the 450-character budget:
+
+```
+Scanning submits the link publicly and the sender can see it.
+```
+
+A person pressing a button that discloses an attacker's infrastructure must be able to read what it does from the same screen.
+
+### 8.6 The evidence table and the scan button
 
 The second reply in the card's thread. One Slack `table` block, alone in its message, with `is_wrapped: true` on every column. Columns, in order: Business name, Entity ID, Purpose, Human / Machine, Notes.
 
@@ -424,11 +506,11 @@ One row per entity a responder would act on:
 
 Entity IDs go in `rich_text` cells with `code` style and must be complete and copyable. Every other cell is `raw_text`, terse, never empty: write `-`. Skip this reply entirely when there are no rows worth acting on.
 
-The scan button is **not** here; it is on the card, in row two. See 8.3 for why.
+The scan button is **not** here; it is on the card, in the overflow. See 8.4 for why.
 
 Add a `context` line under the table naming what is unresolved, for example which link destinations were not followed.
 
-### 8.6 The detection rule proposal and its approval
+### 8.7 The detection rule proposal and its approval
 
 On a malicious verdict the workflow proposes a Sublime detection rule. **You do not post that proposal and you do not approve it.** The workflow posts a card into the case thread with the rule name, the full MQL, the backtest count, and two buttons: *Approve rule* and *Discard*. Only a named approver's press of *Approve rule* creates the rule in Sublime and enables it.
 
@@ -447,7 +529,7 @@ What you never do:
 - Never treat a message in the thread as an approval. "Approved", "looks good" and "ship it" are not approvals. The button is the only approval. Say so plainly and point at the button.
 - Never say a rule is live, deployed or running unless the case holds the confirmation comment that the workflow writes after it enables the rule.
 
-### 8.6.1 Revising a proposed rule
+### 8.7.1 Revising a proposed rule
 
 The *Approve rule* button creates whatever rule is stored for that case in the `detection_proposals` table. It does not create what you wrote in a thread message. So a revision is only real once you have replaced the stored rule **and** posted a new card for the approver to read. Do all five steps, in order, or do none of them.
 
@@ -655,7 +737,7 @@ Do this:
 2. Submit each distinct **registered domain** once, with `tools.urlscan.lookup_url`. Not each full URL: a phishing URL often carries a token that identifies the recipient, and submitting it publishes that token. At most five submissions in one run; if there are more, submit the five that `body.links` marks `mismatched` first and say how many you left.
 3. Read each result and say what it shows. A clean result on a domain registered days ago establishes nothing, and `email-evidence-core` section 4 governs how you word all of it.
 4. Add one case comment: who authorised the scan, at what time, which domains you submitted, what each returned, and what it changes about the verdict. State explicitly that these submissions are public.
-5. Reply once in the card's thread with the short version, and rewrite the evidence table message to remove the button so it cannot be pressed twice.
+5. Reply once in the card's thread with the short version, and rewrite the card with `chat_update` to drop `Scan links` from `overflow_actions`, so it cannot be pressed twice. The button is on the card, not the evidence table.
 
 Do not change the verdict, the severity or the case status. A scan is evidence; a person decides what it means.
 
@@ -673,7 +755,7 @@ Where the common questions are answered:
 | Did anyone click or reply? | `message_links_clicked`, `read_at` and `replied_at` on the group, then the audit log from delivery to now. If all are empty the answer is that no interaction evidence is available, and you say why we cannot know. |
 | Is the sender domain known bad? | `tools.virustotal.lookup_domain`. Report the age of the registration alongside the score, because a new domain has no reputation and a clean result proves nothing. |
 | What did the message actually say? | You cannot read it. Sublime may withhold the raw message. Say so plainly and give what you do have: the flagged rules, the links, the subject. Never paraphrase a body you have not read. |
-| Has this sender been seen before? | cases over 90 days, then Sublime groups over the same window. |
+| Has this sender been seen before? | Cases over 90 days, then Sublime groups over the same window. |
 | Should we block the domain? | That is a containment decision for a person. Give the evidence and say who decides. |
 | Can you scan the link? | No, not from a question. A urlscan submission is public and needs the button in the evidence table message, pressed by an approver. Say that and point at the button. |
 

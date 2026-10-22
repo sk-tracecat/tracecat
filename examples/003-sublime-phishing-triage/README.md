@@ -66,7 +66,7 @@ Slack posts every click and mention to one request URL. Two setups work.
 }
 ```
 
-**Example 001 is already receiving Slack.** Keep 001 as the request URL. Add a router step there that sends phishing clicks here by `action_id`: `phish_verdict_malicious`, `phish_verdict_spam`, `phish_verdict_benign`, `phish_scan_links`, `phish_gen_detection`, `phish_rule_approve`, `phish_rule_discard`.
+**Example 001 is already receiving Slack.** Keep 001 as the request URL. Add a router step there that sends phishing clicks here by `action_id`: `phish_verdict_malicious`, `phish_verdict_spam`, `phish_verdict_benign`, `phish_scan_links`, `phish_gen_detection`, `phish_rule_approve`, `phish_rule_discard`, `phish_link_sublime`, `phish_link_gadmin`.
 
 Save. This adds no scopes, so you do not reinstall the app.
 
@@ -76,14 +76,14 @@ Slack verifies the URL by sending a `challenge` and expecting it back. With `ech
 
 ### Scopes
 
-The manifest is unchanged from examples 001 and 002. Phishing cards are ordinary Block Kit messages. They do not need a scope the other examples do not already request.
+The manifest is unchanged from examples 001 and 002. The phishing card is a Slack Work Object, the same kind of card as examples 001 and 002. It does not need a scope those examples do not already request.
 
 | Scope | Why |
 |---|---|
 | `app_mentions:read` | Questions in a card's thread |
 | `channels:history` | Reading the thread |
 | `chat:write` | Posting and updating the card and the thread |
-| `links:write` | Work Object unfurls used by examples 001 and 002 |
+| `links:write` | The Work Object card, including the phishing card |
 | `reactions:write` | The eyes and tick reactions on a mention |
 | `users:read.email`, with `users:read` | Finding a person by email |
 

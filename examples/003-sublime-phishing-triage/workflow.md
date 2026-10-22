@@ -66,7 +66,7 @@ Create these before the first run. `slack_work_objects` is the same table as exa
 | Table | Columns | Written by | Read by |
 |---|---|---|---|
 | `detection_proposals` | `case_id` (text), `canonical_id`, `rule_name`, `mql_source`, `severity`, `rule_description`, `agent_verdict`, `status` | Detectee, one row per case | The approve lane, by `case_id` |
-| `slack_work_objects` | `external_ref_id` (text), `case_id`, `channel`, `message_ts` | Socky, after the card | The hunt step, to find the card's thread. Shared with examples 001 and 002. |
+| `slack_work_objects` | `external_ref_id` (text, `phish:<canonical id>`), `case_id` (the case UUID), `channel`, `message_ts`, `entity` (JSON) | Socky, after the card | The hunt step and the details panel. Shared with examples 001 and 002. |
 
 `mql_source` holds MQL only. The approve lane refuses to create a rule when that field does not contain `type.`.
 
